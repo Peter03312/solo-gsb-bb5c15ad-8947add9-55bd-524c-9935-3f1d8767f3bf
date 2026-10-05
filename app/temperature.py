@@ -7,11 +7,13 @@
     （409）或同号异内容（409 reading_conflict）拒绝；同号同内容重试返回原记录（200）；
     核定后拒绝新读数；
   * 查询按发生时间列出超温点（读数落在允许闭区间之外）与相邻读数间超过最大测温间隔的
-    缺测区间；跨移交/签收时刻的缺测段按当前有效链的移交、签收事件发生时刻拆分；
+    缺测区间；跨移交/签收时刻的缺测段按当前有效链的移交、签收事件发生时刻拆分，
+    并在**有效入库实际改变保管归属的发生时刻**拆分（无效入库不转移责任，不拆分）；
   * 每段依当前有效保管链标明当时保管人（custodian）或在途移交（in_transit）；
     保管链断链（移交人非当前保管人、在途期间再次移交、签收无对应在途移交）导致归属
     不能确定时，自该事件发生时刻起标为待核（pending_review）且其后不再恢复；
     重复签收、签收要素不符（在途保持）、入库异常与封签检查不改变保管归属，不触发待核；
+    入库保管人与既有保管人相同（归属未变）时不产生实际分界；
   * 乱序补录与移交/签收纠错后，查询即时按当前有效链重算归属；原始读数与旧纠错记录不改；
   * 测温配置与读数不参与保管链核验结论、不产生保管链版本（既有结论与版本规则保持兼容）。
 """
@@ -237,17 +239,27 @@ def create_temp_reading(conn: sqlite3.Connection, data: TempReadingIn) -> tuple[
 
 # --------------------------------------------------------------------------- 保管归属重放
 
-def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dict[str, Any]]:
+def _custody_periods(
+    sample: sqlite3.Row, events: list[sqlite3.Row]
+) -> tuple[list[dict[str, Any]], list[str]]:
     """沿当前有效链重放移交/签收/入库事件，产出覆盖 [采集时间, +∞) 的连续归属时段。
 
-    每段 {"start": ISO, "end": ISO|None, "attribution": {...}}；attribution 形态：
-      * {"kind": "custodian", "custodian": 保管人}
-      * {"kind": "in_transit", "transfer_no", "from_custodian", "to_custodian", "transfer_event_id"}
-      * {"kind": "pending_review", "detail": 断链原因}（待核：断链后归属不能确定）
+    返回 (periods, change_times)：
+      * periods 每段 {"start": ISO, "end": ISO|None, "attribution": {...}}；attribution 形态：
+        - {"kind": "custodian", "custodian": 保管人}
+        - {"kind": "in_transit", "transfer_no", "from_custodian", "to_custodian",
+           "transfer_event_id"}
+        - {"kind": "pending_review", "detail": 断链原因}（待核：断链后归属不能确定）
+      * change_times 为沿链实际改变保管归属状态的事件发生时刻（ISO，按瞬间升序、去重）：
+        合格移交（保管人→在途）、合格签收（在途→签收人）、有效入库（签收人→入库保管人）；
+        无效入库（早于最终签收 / 缺前序移交-签收链）不转移责任、不进列表；
+        入库保管人与既有保管人相同（归属未变）也不进列表——缺测拆分不产生零时长段。
+
     断链（移交人非当前保管人 / 在途期间再次移交 / 签收无对应在途移交）自该事件发生
     时刻起生效且其后不再恢复；重复签收、签收要素不符、入库异常与封签检查不改变归属。
     """
     periods: list[dict[str, Any]] = []
+    change_times: set[str] = set()
     current = sample["collector"]
     open_transfer: dict[str, Any] | None = None     # 在途移交（内部含 occurred_at/_time）
     closed_nos: set[str] = set()
@@ -256,7 +268,7 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
     cursor = sample["collected_at"]
     cursor_t = parse_iso(cursor)
 
-    def attribution() -> dict[str, Any]:
+    def make_attribution() -> dict[str, Any]:
         if broken_detail is not None:
             return {"kind": "pending_review", "detail": broken_detail}
         if open_transfer is not None:
@@ -279,11 +291,9 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
         ref = f"[事件 {ev['event_id']}]"
         if t_dt < parse_iso(sample["collected_at"]):
             continue                                    # 采集前事件无效，保管归属尚未开始
-        # 先以事件发生前状态关闭 [cursor, t) 时段，再应用该事件
-        if t_dt > cursor_t:
-            periods.append({"start": cursor, "end": t, "attribution": attribution()})
-            cursor, cursor_t = t, t_dt
 
+        before = make_attribution()                     # 事件发生前的归属
+        changed = False                                 # 本事件是否实际改变保管归属状态
         if et == "transfer":
             if open_transfer is not None:
                 if broken_detail is None:
@@ -292,12 +302,14 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
                         f"（{open_transfer['from_custodian']} → {open_transfer['to_custodian']}）尚未签收，"
                         "保管链断链，归属不能确定"
                     )
+                    changed = True
             elif p["from_custodian"] != current:
                 if broken_detail is None:
                     broken_detail = (
                         f"{ref} 移交人 {p['from_custodian']} 不是当前保管人 {current}"
                         f"（移交单 {p['transfer_no']}），保管链断链，归属不能确定"
                     )
+                    changed = True
             else:
                 open_transfer = {
                     "transfer_no": p["transfer_no"],
@@ -307,6 +319,7 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
                     "occurred_at": t,
                     "_time": t_dt,
                 }
+                changed = True
         elif et == "receive":
             no = p["transfer_no"]
             if no in closed_nos:
@@ -316,6 +329,7 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
                     broken_detail = (
                         f"{ref} 签收无对应在途移交（单号 {no}），保管链断链，归属不能确定"
                     )
+                    changed = True
             elif (p["receiver"] != open_transfer["to_custodian"]
                   or p["seal_no"] != sample["seal_no"]
                   or t_dt <= open_transfer["_time"]):
@@ -325,16 +339,33 @@ def _custody_periods(sample: sqlite3.Row, events: list[sqlite3.Row]) -> list[dic
                 current = p["receiver"]
                 last_receive_at = t_dt
                 open_transfer = None
+                changed = True
         else:  # storage
             if last_receive_at is not None and t_dt < last_receive_at:
                 pass                                    # 入库早于最终签收：无效，保管状态不变
             elif open_transfer is not None or last_receive_at is None:
                 pass                                    # 缺前序链的入库：待补证，保管状态不变
+            elif broken_detail is not None:
+                pass                                    # 断链后归属恒为待核，入库不改变归属
             else:
-                current = p.get("custodian") or LAB_CUSTODIAN
+                storage_custodian = p.get("custodian") or LAB_CUSTODIAN
+                # 有效入库实际改变保管归属（签收人 → 入库保管人）才作为分界；
+                # 入库保管人与既有保管人相同则归属未变，不产生分界、不产生零时长段。
+                if storage_custodian != current:
+                    current = storage_custodian
+                    changed = True
 
-    periods.append({"start": cursor, "end": None, "attribution": attribution()})
-    return periods
+        # 仅在归属状态实际改变时关闭旧时段（无效事件不产生零时长时段），再应用新状态。
+        # 同瞬间（t_dt == cursor_t）多个事件按 id 顺序连续生效：[t, t) 不落库，
+        # 但时刻仍记入 change_times（去重）；缺测端点与该时刻重合时不产生零时长段。
+        if changed:
+            if t_dt > cursor_t:
+                periods.append({"start": cursor, "end": t, "attribution": before})
+            change_times.add(t)
+            cursor, cursor_t = t, t_dt
+
+    periods.append({"start": cursor, "end": None, "attribution": make_attribution()})
+    return periods, sorted(change_times, key=parse_iso)
 
 
 def _attribution_at(periods: list[dict[str, Any]], t: str) -> dict[str, Any]:
@@ -351,18 +382,17 @@ def _attribution_at(periods: list[dict[str, Any]], t: str) -> dict[str, Any]:
 def _gap_intervals(
     readings: list[sqlite3.Row],
     max_interval: int,
-    split_events: list[sqlite3.Row],
+    change_times: list[str],
     periods: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """按相邻读数计算超间隔缺测区间，并沿用保管链区间拆分与归属。
 
     “超过最大间隔”按真实瞬间严格判定（差值 > max_interval；等于限值不报），
-    小数秒不被截断。跨移交/签收时刻的拆分点同样按真实瞬间选取与排序。
+    小数秒不被截断。拆分点为沿当前有效链实际改变保管归属的事件发生时刻
+    （合格移交/签收、实际改变保管归属的有效入库），按真实瞬间选取与排序；
+    无效入库、未改变归属的入库不拆分。端点与拆分时刻严格开区间比较
+    （prev < t < next）：分界与读数时刻重合时不产生零时长段。
     """
-    split_times = sorted(
-        {ev["occurred_at"] for ev in split_events if ev["event_type"] in ("transfer", "receive")},
-        key=parse_iso,
-    )
     gaps: list[dict[str, Any]] = []
     for prev, nxt in zip(readings, readings[1:]):
         delta = parse_iso(nxt["occurred_at"]) - parse_iso(prev["occurred_at"])
@@ -371,7 +401,7 @@ def _gap_intervals(
         duration = _seconds_number(prev["occurred_at"], nxt["occurred_at"])
         prev_t, nxt_t = parse_iso(prev["occurred_at"]), parse_iso(nxt["occurred_at"])
         bounds = [prev["occurred_at"]]
-        bounds += [t for t in split_times if prev_t < parse_iso(t) < nxt_t]
+        bounds += [t for t in change_times if prev_t < parse_iso(t) < nxt_t]
         bounds.append(nxt["occurred_at"])
         segments = [
             {
@@ -397,9 +427,9 @@ def _gap_intervals(
 # --------------------------------------------------------------------------- 测温证据复核查询
 
 def get_temperature_review(conn: sqlite3.Connection, sample_code: str) -> dict[str, Any]:
-    """按发生时间列出超温点与缺测区间（跨移交/签收时刻拆分），并标明每段归属。
+    """按发生时间列出超温点与缺测区间（跨移交/签收及有效入库改变归属时刻拆分），并标明每段归属。
 
-    归属按查询时的当前有效保管链即时重算：乱序补录读数、补录/纠错移交签收事件后
+    归属按查询时的当前有效保管链即时重算：乱序补录读数、补录/作废/替换移交签收入库事件后
     再次查询即反映最新归属；原始读数与旧纠错记录不被改写。
     """
     sample = get_sample_or_404(conn, sample_code)
@@ -421,7 +451,7 @@ def get_temperature_review(conn: sqlite3.Connection, sample_code: str) -> dict[s
         (sample["id"],),
     ).fetchall()
     events.sort(key=event_time_key)
-    periods = _custody_periods(sample, events)
+    periods, change_times = _custody_periods(sample, events)
 
     min_c = config["min_celsius"]
     max_c = config["max_celsius"]
@@ -452,7 +482,7 @@ def get_temperature_review(conn: sqlite3.Connection, sample_code: str) -> dict[s
                 "attribution": _attribution_at(periods, r["occurred_at"]),
             })
 
-    gaps = _gap_intervals(readings, max_interval, events, periods)
+    gaps = _gap_intervals(readings, max_interval, change_times, periods)
 
     return {
         "sample_code": sample["sample_code"],

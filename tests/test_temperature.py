@@ -211,11 +211,177 @@ check("缺测区间 2 跨签收时刻拆分：在途→签收人",
       [s["attribution"]["kind"] for s in g2["segments"]] == ["in_transit", "custodian"]
       and g2["segments"][1]["attribution"]["custodian"] == "李运输"
       and g2["segments"][1]["start"] == "2026-09-30T05:00:00Z", str(g2))
-check("缺测区间 3 不跨移交/签收（入库不拆分）为单段",
-      len(g3["segments"]) == 1 and g3["start"] == "2026-09-30T05:30:00Z"
-      and g3["end"] == "2026-09-30T06:30:00Z", str(g3))
-check("缺测区间 3 归属按段起始时刻（入库前保管人）",
-      g3["segments"][0]["attribution"] == {"kind": "custodian", "custodian": "李运输"}, str(g3))
+check("缺测区间 3 跨有效入库时刻拆分：签收人→入库保管人",
+      len(g3["segments"]) == 2
+      and g3["segments"][0]["end"] == "2026-09-30T06:00:00Z"
+      and g3["segments"][1]["start"] == "2026-09-30T06:00:00Z"
+      and g3["segments"][0]["attribution"] == {"kind": "custodian", "custodian": "李运输"}
+      and g3["segments"][1]["attribution"] == {"kind": "custodian", "custodian": "实验室"},
+      str(g3))
+
+# ------------------------------------------------- 3b. 有效入库改变保管归属时拆分（本轮）
+print("3b) 缺测区间跨有效入库实际改变保管归属的发生时刻拆分；无效/不改变归属的入库不拆分")
+
+# 场景 A：缺前序移交-签收链的入库（无效入库）不转移责任、不拆分；补链重录后即时重算
+reg("T-STG1", collector="王采集")
+cfg("T-STG1")
+rd("T-STG1", "RD-S1-1", "2026-09-30T01:30:00Z", 4.0)
+rd("T-STG1", "RD-S1-2", "2026-09-30T04:30:00Z", 5.0)
+ev({"event_id": "EVT-S1-BAD", "event_type": "storage", "sample_code": "T-STG1",
+    "occurred_at": "2026-09-30T03:00:00Z", "custodian": "冷库实验室"})    # 缺前序链 → 无效入库
+v = review("T-STG1").json()
+check("无效入库（缺前序链）不拆分缺测段，全段仍归采集人",
+      kinds(v) == [["custodian"]]
+      and v["gap_intervals"][0]["segments"][0]["attribution"]["custodian"] == "王采集", str(v["gap_intervals"]))
+# 乱序补录完整链：移交 01:45、签收 02:15（均早于入库 03:00）→ 原入库在当前有效链上变为有效
+ev({"event_id": "EVT-S1-T1", "event_type": "transfer", "sample_code": "T-STG1",
+    "occurred_at": "2026-09-30T01:45:00Z", "transfer_no": "TR-S1",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-S1-R1", "event_type": "receive", "sample_code": "T-STG1",
+    "occurred_at": "2026-09-30T02:15:00Z", "transfer_no": "TR-S1",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+v = review("T-STG1").json()
+check("补链后即时重算：缺测段跨移交/签收/有效入库拆为三段，末段归入库保管人",
+      kinds(v) == [["custodian", "in_transit", "custodian", "custodian"]]
+      and [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == ["王采集", None, "李运输", "冷库实验室"]
+      and [s["start"] for s in v["gap_intervals"][0]["segments"]][-1] == "2026-09-30T03:00:00Z",
+      str(v["gap_intervals"]))
+
+# 场景 B：入库保管人与既有保管人相同 → 归属未变，不产生分界
+reg("T-STG2", collector="王采集")
+cfg("T-STG2")
+ev({"event_id": "EVT-S2-T1", "event_type": "transfer", "sample_code": "T-STG2",
+    "occurred_at": "2026-09-30T01:45:00Z", "transfer_no": "TR-S2",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-S2-R1", "event_type": "receive", "sample_code": "T-STG2",
+    "occurred_at": "2026-09-30T02:15:00Z", "transfer_no": "TR-S2",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-S2-S1", "event_type": "storage", "sample_code": "T-STG2",
+    "occurred_at": "2026-09-30T03:00:00Z", "custodian": "李运输"})       # 保管人未变
+rd("T-STG2", "RD-S2-1", "2026-09-30T01:30:00Z", 4.0)
+rd("T-STG2", "RD-S2-2", "2026-09-30T04:30:00Z", 5.0)
+v = review("T-STG2").json()
+check("入库保管人与既有保管人相同：入库时刻不产生分界",
+      [[s["start"] for s in g["segments"]] for g in v["gap_intervals"]]
+      == [["2026-09-30T01:30:00Z", "2026-09-30T01:45:00Z", "2026-09-30T02:15:00Z"]]
+      and kinds(v) == [["custodian", "in_transit", "custodian"]], str(v["gap_intervals"]))
+
+# 场景 C：入库早于最终签收 → 无效入库，不拆分、不转移责任
+reg("T-STG3", collector="王采集")
+cfg("T-STG3")
+ev({"event_id": "EVT-S3-T1", "event_type": "transfer", "sample_code": "T-STG3",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-S3",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-S3-S1", "event_type": "storage", "sample_code": "T-STG3",
+    "occurred_at": "2026-09-30T02:30:00Z", "custodian": "冷库实验室"})    # 在途期间入库 → 无效
+ev({"event_id": "EVT-S3-R1", "event_type": "receive", "sample_code": "T-STG3",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-S3",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+rd("T-STG3", "RD-S3-1", "2026-09-30T01:30:00Z", 4.0)
+rd("T-STG3", "RD-S3-2", "2026-09-30T04:30:00Z", 5.0)
+v = review("T-STG3").json()
+check("在途期间（缺签收）的无效入库不拆分：仅移交/签收分界，末段仍归签收人",
+      kinds(v) == [["custodian", "in_transit", "custodian"]]
+      and v["gap_intervals"][0]["segments"][-1]["attribution"]["custodian"] == "李运输"
+      and "2026-09-30T02:30:00Z" not in [s["start"] for s in v["gap_intervals"][0]["segments"]],
+      str(v["gap_intervals"]))
+
+# 场景 D：分界时刻与读数时刻重合 → 不产生零时长段
+reg("T-STG4", collector="王采集")
+cfg("T-STG4")
+ev({"event_id": "EVT-S4-T1", "event_type": "transfer", "sample_code": "T-STG4",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-S4",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-S4-R1", "event_type": "receive", "sample_code": "T-STG4",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-S4",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-S4-S1", "event_type": "storage", "sample_code": "T-STG4",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "冷库实验室"})
+rd("T-STG4", "RD-S4-1", "2026-09-30T01:30:00Z", 4.0)
+rd("T-STG4", "RD-S4-2", "2026-09-30T04:00:00Z", 5.0)      # 读数恰在入库时刻
+rd("T-STG4", "RD-S4-3", "2026-09-30T05:30:00Z", 9.5)      # 超温（入库后）
+v = review("T-STG4").json()
+g = v["gap_intervals"][1]     # RD-S4-2(04:00) → RD-S4-3(05:30)
+check("读数与入库时刻重合不产生零时长段，该读数按入库后归属",
+      len(g["segments"]) == 1 and g["segments"][0]["start"] == "2026-09-30T04:00:00Z"
+      and g["segments"][0]["duration_seconds"] == 5400
+      and g["segments"][0]["attribution"] == {"kind": "custodian", "custodian": "冷库实验室"}
+      and all(s["duration_seconds"] != 0 for gg in v["gap_intervals"] for s in gg["segments"]),
+      str(v["gap_intervals"]))
+check("入库时刻后的超温点归入库保管人",
+      v["out_of_range_points"][0]["reading_id"] == "RD-S4-3"
+      and v["out_of_range_points"][0]["attribution"] == {"kind": "custodian", "custodian": "冷库实验室"},
+      str(v["out_of_range_points"]))
+
+# 场景 E：有效入库事件被作废 → 即时重算，后段回到签收人；再次替换入库 → 重新归属
+reg("T-STG5", collector="王采集")
+cfg("T-STG5")
+ev({"event_id": "EVT-S5-T1", "event_type": "transfer", "sample_code": "T-STG5",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-S5",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-S5-R1", "event_type": "receive", "sample_code": "T-STG5",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-S5",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-S5-S1", "event_type": "storage", "sample_code": "T-STG5",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "冷库实验室"})
+rd("T-STG5", "RD-S5-1", "2026-09-30T02:30:00Z", 4.0)
+rd("T-STG5", "RD-S5-2", "2026-09-30T05:30:00Z", 5.0)
+v = review("T-STG5").json()
+check("纠错前：缺口跨移交/签收/有效入库拆分，在途→签收人→冷库实验室",
+      [s["attribution"]["kind"] for s in v["gap_intervals"][0]["segments"]]
+      == ["in_transit", "custodian", "custodian"]
+      and [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == [None, "李运输", "冷库实验室"],
+      str(v["gap_intervals"]))
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "FIX-S5-1", "sample_code": "T-STG5", "target_event_id": "EVT-S5-S1",
+    "action": "void", "operator": "质控员", "reason": "入库记录作废，归属回到签收人"})
+check("作废入库纠错 201", r.status_code == 201, r.text)
+v = review("T-STG5").json()
+check("入库作废后即时重算：不再按入库拆分，末段归签收人",
+      [s["attribution"]["kind"] for s in v["gap_intervals"][0]["segments"]]
+      == ["in_transit", "custodian"]
+      and v["gap_intervals"][0]["segments"][-1]["attribution"]["custodian"] == "李运输",
+      str(v["gap_intervals"]))
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "FIX-S5-2", "sample_code": "T-STG5",
+    "target_event_id": "EVT-S5-R1", "action": "replace", "operator": "质控员",
+    "reason": "签收时间更正",
+    "new_event": {"event_id": "EVT-S5-R2", "event_type": "receive",
+                  "occurred_at": "2026-09-30T02:15:00Z", "transfer_no": "TR-S5",
+                  "receiver": "李运输", "seal_no": "SEAL-T"}})
+check("替换签收纠错 201", r.status_code == 201, r.text)
+v = review("T-STG5").json()
+check("签收替换后拆分点即时重算（新签收 02:15 早于读数 02:30，缺口单段归签收人；旧 03:00 分界消失）",
+      len(v["gap_intervals"][0]["segments"]) == 1
+      and v["gap_intervals"][0]["segments"][0]["start"] == "2026-09-30T02:30:00Z"
+      and v["gap_intervals"][0]["segments"][0]["attribution"]["custodian"] == "李运输",
+      str(v["gap_intervals"]))
+
+# 场景 F：多次有效入库（保管人再变更）逐次拆分；原始读数不产生保管链版本
+reg("T-STG6", collector="王采集")
+cfg("T-STG6")
+ev({"event_id": "EVT-S6-T1", "event_type": "transfer", "sample_code": "T-STG6",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-S6",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-S6-R1", "event_type": "receive", "sample_code": "T-STG6",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-S6",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-S6-S1", "event_type": "storage", "sample_code": "T-STG6",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "冷库甲"})
+ev({"event_id": "EVT-S6-S2", "event_type": "storage", "sample_code": "T-STG6",
+    "occurred_at": "2026-09-30T06:00:00Z", "custodian": "冷库乙"})
+rd("T-STG6", "RD-S6-1", "2026-09-30T01:30:00Z", 4.0)
+rd("T-STG6", "RD-S6-2", "2026-09-30T07:30:00Z", 5.0)
+v = review("T-STG6").json()
+check("两次有效入库逐次拆分，保管人 王采集→在途→李运输→冷库甲→冷库乙",
+      [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == ["王采集", None, "李运输", "冷库甲", "冷库乙"]
+      and [s["start"] for s in v["gap_intervals"][0]["segments"]]
+      == ["2026-09-30T01:30:00Z", "2026-09-30T02:00:00Z", "2026-09-30T03:00:00Z",
+          "2026-09-30T04:00:00Z", "2026-09-30T06:00:00Z"],
+      str(v["gap_intervals"]))
 
 # ---------------------------------------------------------------- 4. 断链 → 待核
 print("4) 断链导致归属不能确定时标为待核（pending_review）")

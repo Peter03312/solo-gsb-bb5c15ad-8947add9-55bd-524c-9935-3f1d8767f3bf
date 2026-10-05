@@ -770,6 +770,98 @@ def main() -> None:
             who = a.get("custodian") or (f"在途 {a.get('transfer_no')}" if a["kind"] == "in_transit" else "待核")
             print(f"  重算后段 {seg['start']} → {seg['end']} 归属: {who}")
 
+    # 17.5b) 有效入库实际改变保管归属：缺测区间在入库时刻拆分，作废/无效入库对照（本轮行为）
+    print("\n=== 缺测区间跨有效入库的分段归属（本轮） ===")
+    scode = f"API-STG-{run_id}"
+    call("POST", "/samples", {
+        "sample_code": scode, "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector, "seal_no": "SEAL-STG-1",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-SEVT-T1-{run_id}", "event_type": "transfer", "sample_code": scode,
+        "occurred_at": "2026-09-30T01:45:00Z",
+        "transfer_no": "TR-STG-1", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-SEVT-R1-{run_id}", "event_type": "receive", "sample_code": scode,
+        "occurred_at": "2026-09-30T02:15:00Z",
+        "transfer_no": "TR-STG-1", "receiver": "李运输", "seal_no": "SEAL-STG-1",
+    })
+    call("POST", "/temperature-configs", {
+        "sample_code": scode, "min_celsius": 2.0, "max_celsius": 8.0, "max_interval_seconds": 1800,
+    })
+    # 两条读数间隔 3 小时（02:30 → 05:30），入库时刻 04:00 落在区间内
+    call("POST", "/temperature-readings", {
+        "sample_code": scode, "reading_id": f"API-SRD-A-{run_id}",
+        "device_id": "DEV-COLD-STG", "occurred_at": "2026-09-30T02:30:00Z", "value_celsius": 5.0,
+    })
+    call("POST", "/temperature-readings", {
+        "sample_code": scode, "reading_id": f"API-SRD-B-{run_id}",
+        "device_id": "DEV-COLD-STG", "occurred_at": "2026-09-30T05:30:00Z", "value_celsius": 5.0,
+    })
+    s, r = call("GET", f"/samples/{scode}/temperature")
+    seg = r["gap_intervals"][0]["segments"][0]
+    print("入库前：缺测单段，归属 =", seg["attribution"].get("custodian"),
+          f"[HTTP {s}]")
+
+    def show_gap(label: str) -> None:
+        _s, rr = call("GET", f"/samples/{scode}/temperature")
+        for gg in rr["gap_intervals"]:
+            for ss in gg["segments"]:
+                aa = ss["attribution"]
+                who = aa.get("custodian") or (
+                    f"在途 {aa.get('transfer_no')}" if aa["kind"] == "in_transit" else "待核")
+                print(f"  {label} 段 {ss['start']} → {ss['end']}"
+                      f"（{ss['duration_seconds']}秒）归属: {who}")
+
+    # 有效入库改变保管归属（李运输 → 实验室）：04:00 处拆分，后段归实验室
+    s, r = call("POST", "/events", {
+        "event_id": f"API-SEVT-S1-{run_id}", "event_type": "storage", "sample_code": scode,
+        "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室", "storage_location": "冷库A",
+    })
+    print("有效入库（04:00，李运输 → 实验室）: HTTP", s)
+    show_gap("入库后")
+
+    # 作废入库 → 查询即时重算，缺测回到单段签收人（原始读数/版本不受测温影响）
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-SFIX-1-{run_id}", "sample_code": scode,
+        "target_event_id": f"API-SEVT-S1-{run_id}", "action": "void",
+        "operator": "质控员", "reason": "示例：入库作废，演示即时重算",
+    })
+    print("作废入库纠错: HTTP", s)
+    show_gap("作废后")
+
+    # 无效入库（在途期间，缺前序签收链）不拆分：另起一份样本演示
+    scode2 = f"API-STG2-{run_id}"
+    call("POST", "/samples", {
+        "sample_code": scode2, "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector, "seal_no": "SEAL-STG-2",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-S2-T1-{run_id}", "event_type": "transfer", "sample_code": scode2,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": "TR-STG-2", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/temperature-configs", {
+        "sample_code": scode2, "min_celsius": 2.0, "max_celsius": 8.0, "max_interval_seconds": 1800,
+    })
+    call("POST", "/temperature-readings", {
+        "sample_code": scode2, "reading_id": f"API-S2-A-{run_id}",
+        "device_id": "DEV-COLD-STG2", "occurred_at": "2026-09-30T01:30:00Z", "value_celsius": 5.0,
+    })
+    call("POST", "/temperature-readings", {
+        "sample_code": scode2, "reading_id": f"API-S2-B-{run_id}",
+        "device_id": "DEV-COLD-STG2", "occurred_at": "2026-09-30T04:30:00Z", "value_celsius": 5.0,
+    })
+    # 在途期间入库（03:00）→ 无效入库，缺测段仅在移交时刻拆分，不按入库拆分
+    call("POST", "/events", {
+        "event_id": f"API-S2-S0-{run_id}", "event_type": "storage", "sample_code": scode2,
+        "occurred_at": "2026-09-30T03:00:00Z", "custodian": "实验室",
+    })
+    _s, r2 = call("GET", f"/samples/{scode2}/temperature")
+    kinds = [ss["attribution"]["kind"] for gg in r2["gap_intervals"] for ss in gg["segments"]]
+    print("在途期间的无效入库不拆分，缺测段归属序列 =", kinds)
+
     # 18) 测温设备校准证明 + 可信复核（证明可晚于读数补录，不改变原始读数/版本/案卷）
     print("\n=== 测温设备校准证明与可信复核 ===")
     cal_id = f"API-CAL-{run_id}"

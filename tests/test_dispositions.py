@@ -749,6 +749,113 @@ else:
           and ledger("DISP-14").json()["total"] == 0, str(p14))
 check("无论次序均无陈旧有效意见", v["active_count"] == 0, str(v))
 
+# ------------------------------------- 20. 有效入库改变保管归属：提交事务内失效；无效/未变不失效
+print("20) 入库实际改变保管归属时缺测摘要事务内失效；无效入库/归属未变不失效；恢复不复活")
+reg("DISP-15")
+cfg("DISP-15")
+rd("DISP-15", "D15-RD-A", "2026-09-30T02:30:00Z", 5.0, "DEV-D-15")
+rd("DISP-15", "D15-RD-B", "2026-09-30T05:30:00Z", 5.0, "DEV-D-15")
+cert("D15-C1", "DEV-D-15", "2026-09-30T01:00:00Z", "2026-09-30T08:00:00Z")
+ev("D15-EVT-T1", "transfer", "DISP-15", "2026-09-30T01:45:00Z",
+   transfer_no="D15-TR-1", from_custodian="王采集", to_custodian="李运输")
+ev("D15-EVT-R1", "receive", "DISP-15", "2026-09-30T02:15:00Z",
+   transfer_no="D15-TR-1", receiver="李运输", seal_no="SEAL-D")
+gid15 = "gap:D15-RD-A:D15-RD-B"
+v = anomalies("DISP-15").json()
+g15 = anomaly_of(v, gid15)
+check("入库前缺测单段归签收人",
+      len(g15["segments"]) == 1
+      and g15["segments"][0]["attribution"] == {"kind": "custodian", "custodian": "李运输"}, str(g15))
+dig15 = g15["evidence_digest"]
+r = dispose("DISP-15", "DISP-NO-D15-1", gid15, dig15, reason="认可缺测", handler="质控员赵")
+check("缺测处置成功 201", r.status_code == 201, r.text)
+
+# 有效入库（04:00，保管人由李运输变为冷库实验室）→ 提交事务内旧意见即失效
+r = ev("D15-EVT-S1", "storage", "DISP-15", "2026-09-30T04:00:00Z", custodian="冷库实验室")
+check("有效入库事件 201", r.status_code == 201, r.text)
+trusted = client.get(f"{API}/samples/DISP-15/temperature/trusted").json()
+check("可信复核：缺测跨有效入库时刻拆分，末段归冷库实验室",
+      [(s["attribution"].get("custodian"), s["start"]) for s in trusted["gap_intervals"][0]["segments"]]
+      == [("李运输", "2026-09-30T02:30:00Z"), ("冷库实验室", "2026-09-30T04:00:00Z")],
+      str(trusted["gap_intervals"]))
+v = anomalies("DISP-15").json()
+g15b = anomaly_of(v, gid15)
+check("入库改变归属：摘要变化，旧意见在提交事务内失效（evidence_changed）",
+      g15b["evidence_digest"] != dig15
+      and g15b["disposition_status"] == "pending"
+      and len(g15b["invalidated_history"]) == 1
+      and g15b["invalidated_history"][0]["invalidate_reason"] == "evidence_changed"
+      and g15b["invalidated_history"][0]["current_evidence_digest"] == g15b["evidence_digest"],
+      str(g15b))
+# 旧摘要重提被拒
+r = dispose("DISP-15", "DISP-NO-D15-OLD", gid15, dig15, reason="旧摘要重试", handler="质控员赵")
+check("旧摘要提交 422 anomaly_stale(evidence_changed)",
+      r.status_code == 422 and r.json()["error"]["details"]["reason"] == "evidence_changed", r.text)
+# 同号同内容重试不复活旧意见，返回其失效状态
+r = dispose("DISP-15", "DISP-NO-D15-1", gid15, dig15, reason="认可缺测", handler="质控员赵")
+check("同号同内容重试 200 且返回失效状态（不因重试复活）",
+      r.status_code == 200 and r.json()["disposition"]["status"] == "invalidated", r.text)
+
+# 作废入库 → 摘要恢复原值，旧意见仍不复活
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "D15-FIX-S1", "sample_code": "DISP-15", "target_event_id": "D15-EVT-S1",
+    "action": "void", "operator": "链管理员", "reason": "入库误录作废"})
+check("作废入库纠错 201", r.status_code == 201, r.text)
+v = anomalies("DISP-15").json()
+g15c = anomaly_of(v, gid15)
+check("作废后摘要恢复原值但旧意见不复活",
+      g15c["evidence_digest"] == dig15 and g15c["disposition_status"] == "pending"
+      and len(g15c["invalidated_history"]) == 1
+      and g15c["invalidated_history"][0]["status"] == "invalidated", str(g15c))
+r = dispose("DISP-15", "DISP-NO-D15-2", gid15, dig15,
+            reason="证据恢复后重新认可", handler="质控员赵")
+check("恢复原摘要后用新单号可重新处置 201（同号同内容不算重试失效）",
+      r.status_code == 201 and r.json()["disposition"]["status"] == "active", r.text)
+
+# 无效入库（缺前序链）与归属未变的入库不改变归属、不触发失效
+reg("DISP-16")
+cfg("DISP-16")
+rd("DISP-16", "D16-RD-1", "2026-09-30T03:00:00Z", 9.5, "DEV-D-16")
+cert("D16-C1", "DEV-D-16", "2026-09-30T01:00:00Z", "2026-09-30T08:00:00Z")
+ev("D16-EVT-T1", "transfer", "DISP-16", "2026-09-30T01:45:00Z",
+   transfer_no="D16-TR-1", from_custodian="王采集", to_custodian="李运输")
+ev("D16-EVT-R1", "receive", "DISP-16", "2026-09-30T02:15:00Z",
+   transfer_no="D16-TR-1", receiver="李运输", seal_no="SEAL-D")
+pid16 = "oor:D16-RD-1"
+dig16 = anomalies("DISP-16").json()
+p16 = anomaly_of(dig16, pid16)
+check("超温点在签收后归签收人", p16["attribution"] == {"kind": "custodian", "custodian": "李运输"}, str(p16))
+d16 = p16["evidence_digest"]
+r = dispose("DISP-16", "DISP-NO-D16-1", pid16, d16, reason="认可", handler="质控员赵")
+check("超温处置成功 201", r.status_code == 201, r.text)
+# 缺前序链的无效入库（01:30，早于签收）→ 不转移责任
+r = ev("D16-EVT-S0", "storage", "DISP-16", "2026-09-30T01:30:00Z", custodian="冷库实验室")
+check("无效入库事件仍落库 201", r.status_code == 201, r.text)
+v = anomalies("DISP-16").json()
+check("无效入库不改变归属：超温点仍归签收人、处置仍有效、摘要不变",
+      anomaly_of(v, pid16)["attribution"] == {"kind": "custodian", "custodian": "李运输"}
+      and anomaly_of(v, pid16)["evidence_digest"] == d16
+      and anomaly_of(v, pid16)["disposition_status"] == "active", str(v))
+# 有效入库但保管人未变（仍为李运输）→ 不产生分界、摘要不变
+r = ev("D16-EVT-S1", "storage", "DISP-16", "2026-09-30T03:30:00Z", custodian="李运输")
+check("归属未变入库 201", r.status_code == 201, r.text)
+v = anomalies("DISP-16").json()
+check("入库保管人与既有保管人相同：处置仍有效、摘要不变",
+      anomaly_of(v, pid16)["evidence_digest"] == d16
+      and anomaly_of(v, pid16)["disposition_status"] == "active"
+      and anomaly_of(v, pid16)["invalidated_history"] == [], str(v))
+# 再由有效入库实际改变保管归属 → 超温点（03:00）在入库前，归属仍为李运输：摘要不应变；
+# 改用一条入库后的超温点验证
+rd("DISP-16", "D16-RD-2", "2026-09-30T04:30:00Z", 9.2, "DEV-D-16")
+r = ev("D16-EVT-S2", "storage", "DISP-16", "2026-09-30T04:00:00Z", custodian="冷库实验室")
+check("第二次有效入库（改变归属）201", r.status_code == 201, r.text)
+v = anomalies("DISP-16").json()
+check("入库前超温点归属与处置不变；入库后超温点归冷库实验室",
+      anomaly_of(v, pid16)["attribution"] == {"kind": "custodian", "custodian": "李运输"}
+      and anomaly_of(v, pid16)["disposition_status"] == "active"
+      and anomaly_of(v, "oor:D16-RD-2")["attribution"]
+      == {"kind": "custodian", "custodian": "冷库实验室"}, str(v))
+
 check("健康检查可用", client.get("/health").json()["status"] == "ok")
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
