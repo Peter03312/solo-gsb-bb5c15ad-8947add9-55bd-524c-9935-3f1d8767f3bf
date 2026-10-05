@@ -221,6 +221,40 @@ check("有证读数间跨移交/签收时刻拆分为三段",
       == ["2026-09-30T01:30:00Z", "2026-09-30T02:30:00Z", "2026-09-30T04:30:00Z"], str(gap))
 check("无证超温点不列入可信超温", v["out_of_range_points"] == [], str(v))
 
+# 可信缺测区间跨越有效入库时刻同样拆分（分段依据与普通测温复核一致）
+reg("CAL-GAP-STO")
+cfg("CAL-GAP-STO", interval=1800)
+client.post(f"{API}/events", json={
+    "event_id": "CAL-GS-T1", "event_type": "transfer", "sample_code": "CAL-GAP-STO",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "CAL-TR-GS",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+client.post(f"{API}/events", json={
+    "event_id": "CAL-GS-R1", "event_type": "receive", "sample_code": "CAL-GAP-STO",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "CAL-TR-GS",
+    "receiver": "李运输", "seal_no": "SEAL-C"})
+client.post(f"{API}/events", json={
+    "event_id": "CAL-GS-S1", "event_type": "storage", "sample_code": "CAL-GAP-STO",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+rd("CAL-GAP-STO", "GS-RD-1", "2026-09-30T03:30:00Z", 4.0, "DEV-GAP-STO")
+rd("CAL-GAP-STO", "GS-RD-2", "2026-09-30T05:00:00Z", 5.0, "DEV-GAP-STO")
+cert("GS-C1", "DEV-GAP-STO", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+v = trusted("CAL-GAP-STO").json()
+check("可信缺测跨有效入库拆分：签收人 → 实验室",
+      len(v["gap_intervals"]) == 1
+      and [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == ["李运输", "实验室"]
+      and v["gap_intervals"][0]["segments"][1]["start"] == "2026-09-30T04:00:00Z", str(v))
+# 作废入库事件后可信复核即时重算为单段
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CAL-GS-FIX", "sample_code": "CAL-GAP-STO", "target_event_id": "CAL-GS-S1",
+    "action": "void", "operator": "质控员", "reason": "入库记录作废演示"})
+check("作废入库纠错 201", r.status_code == 201, r.text)
+v = trusted("CAL-GAP-STO").json()
+check("入库作废后可信缺测回到签收人单段",
+      len(v["gap_intervals"]) == 1 and len(v["gap_intervals"][0]["segments"]) == 1
+      and v["gap_intervals"][0]["segments"][0]["attribution"]
+      == {"kind": "custodian", "custodian": "李运输"}, str(v))
+
 # ---------------------------------------------------------------- 5. 补录/作废即时重算，原查询和版本不变
 print("5) 补录/作废证明后即时重算；不改原始读数、既有测温查询和保管链版本")
 reg("CAL-LIVE")

@@ -454,8 +454,75 @@ check("核定样本旧处置随证明作废标记失效",
       and lg["items"][0]["invalidate_reason"] == "anomaly_gone", str(lg))
 check("版本仍不变", versions("DISP-5")["current_version"] == approved_version)
 
-# ---------------------------------------------------------------- 12. 并发：同异常同摘要只一条有效
-print("12) 并发：同异常同摘要两条不同单号仅一条成功")
+# ---------------------------------------------------------------- 12. 入库事件改变缺测分段：处置失效追踪（本轮修复）
+print("12) 补录/作废入库改变缺测分段与归属：旧意见提交事务内失效、不复活、同号重试不触发")
+reg("DISP-STO")
+cfg("DISP-STO")
+ev("DS-EVT-T1", "transfer", "DISP-STO", "2026-09-30T02:00:00Z",
+   transfer_no="DS-TR", from_custodian="王采集", to_custodian="李运输")
+ev("DS-EVT-R1", "receive", "DISP-STO", "2026-09-30T03:00:00Z",
+   transfer_no="DS-TR", receiver="李运输", seal_no="SEAL-D")
+rd("DISP-STO", "DS-RD-1", "2026-09-30T03:30:00Z", 4.0, "DEV-D-STO")
+rd("DISP-STO", "DS-RD-2", "2026-09-30T05:00:00Z", 5.0, "DEV-D-STO")
+cert("DS-C1", "DEV-D-STO", "2026-09-30T01:00:00Z", "2026-09-30T06:00:00Z")
+v = anomalies("DISP-STO").json()
+gid = "gap:DS-RD-1:DS-RD-2"
+check("缺测异常单段归签收人（尚无入库）",
+      v["total"] == 1
+      and [s["attribution"].get("custodian") for s in anomaly_of(v, gid)["segments"]] == ["李运输"],
+      str(v))
+dig0 = anomaly_of(v, gid)["evidence_digest"]
+r = dispose("DISP-STO", "DISP-NO-DS-1", gid, dig0, reason="认可缺测（入库前证据）", handler="质控员赵")
+check("处置缺测 201", r.status_code == 201, r.text)
+
+# 补录有效入库事件（缺测区间内）→ 分段与归属变化 → 提交事务内旧意见即失效
+r = ev("DS-EVT-S1", "storage", "DISP-STO", "2026-09-30T04:00:00Z", custodian="实验室")
+check("补录入库事件 201", r.status_code == 201, r.text)
+v = anomalies("DISP-STO").json()
+g_now = anomaly_of(v, gid)
+check("入库后缺测按入库时刻拆分：签收人 → 实验室",
+      [s["attribution"].get("custodian") for s in g_now["segments"]] == ["李运输", "实验室"]
+      and g_now["segments"][1]["start"] == "2026-09-30T04:00:00Z", str(g_now))
+check("旧意见在入库提交事务内已失效（evidence_changed，记录当前摘要）",
+      g_now["disposition_status"] == "pending"
+      and len(g_now["invalidated_history"]) == 1
+      and g_now["invalidated_history"][0]["disposition_no"] == "DISP-NO-DS-1"
+      and g_now["invalidated_history"][0]["invalidate_reason"] == "evidence_changed"
+      and g_now["invalidated_history"][0]["current_evidence_digest"] == g_now["evidence_digest"],
+      str(g_now))
+
+# 作废入库事件 → 摘要恢复原值，但旧意见不复活
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "DS-FIX-1", "sample_code": "DISP-STO", "target_event_id": "DS-EVT-S1",
+    "action": "void", "operator": "质控员", "reason": "入库单误录，作废"})
+check("作废入库纠错 201", r.status_code == 201, r.text)
+v = anomalies("DISP-STO").json()
+g_back = anomaly_of(v, gid)
+check("作废入库后摘要恢复原值、归属回到签收人单段",
+      g_back["evidence_digest"] == dig0
+      and [s["attribution"].get("custodian") for s in g_back["segments"]] == ["李运输"], str(g_back))
+check("旧意见不复活（仍失效留痕，当前异常未处置）",
+      g_back["disposition_status"] == "pending"
+      and len(g_back["invalidated_history"]) == 1
+      and g_back["invalidated_history"][0]["status"] == "invalidated", str(g_back))
+
+# 恢复原摘要后可用新单号重新处置
+r = dispose("DISP-STO", "DISP-NO-DS-2", gid, dig0, reason="证据恢复后重新认可", handler="质控员赵")
+check("原摘要新单号重新处置 201", r.status_code == 201, r.text)
+
+# 同号同内容重试（已作废的入库事件、作废纠错）不触发失效
+r = ev("DS-EVT-S1", "storage", "DISP-STO", "2026-09-30T04:00:00Z", custodian="实验室")
+check("已作废入库事件同号同内容重试 200 幂等", r.status_code == 200 and r.json()["idempotent"] is True, r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "DS-FIX-1", "sample_code": "DISP-STO", "target_event_id": "DS-EVT-S1",
+    "action": "void", "operator": "质控员", "reason": "入库单误录，作废"})
+check("作废纠错同号同内容重试 200 幂等", r.status_code == 200, r.text)
+lg = ledger("DISP-STO", status="active").json()
+check("同号同内容重试不触发失效（新处置仍有效）",
+      lg["total"] == 1 and lg["items"][0]["disposition_no"] == "DISP-NO-DS-2", str(lg))
+
+# ---------------------------------------------------------------- 13. 并发：同异常同摘要只一条有效
+print("13) 并发：同异常同摘要两条不同单号仅一条成功")
 reg("DISP-6")
 cfg("DISP-6")
 rd("DISP-6", "D6-RD-1", "2026-09-30T02:00:00Z", 9.0, "DEV-D-6")

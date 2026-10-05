@@ -770,6 +770,100 @@ def main() -> None:
             who = a.get("custodian") or (f"在途 {a.get('transfer_no')}" if a["kind"] == "in_transit" else "待核")
             print(f"  重算后段 {seg['start']} → {seg['end']} 归属: {who}")
 
+    # 17.6) 有效入库拆分缺测区间（本轮行为）：入库实际改变保管归属的发生时刻成为分段点；
+    #       无效入库不拆分；补录/作废入库后普通与可信查询即时重算，异常处置证据摘要随之失效
+    print("\n=== 缺测区间跨有效入库拆分（本轮行为） ===")
+    run_s = uuid.uuid4().hex[:8]
+    scode = f"API-TEMPSTO-{run_s}"
+    call("POST", "/samples", {
+        "sample_code": scode, "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector, "seal_no": f"SEAL-STO-{run_s}",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-SEVT-T1-{run_s}", "event_type": "transfer", "sample_code": scode,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": f"TR-STO-{run_s}", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-SEVT-R1-{run_s}", "event_type": "receive", "sample_code": scode,
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "transfer_no": f"TR-STO-{run_s}", "receiver": "李运输", "seal_no": f"SEAL-STO-{run_s}",
+    })
+    call("POST", "/temperature-configs", {
+        "sample_code": scode, "min_celsius": 2.0, "max_celsius": 8.0, "max_interval_seconds": 1800,
+    })
+    for rid, when, value in [
+        (f"API-SRD-1-{run_s}", "2026-09-30T03:30:00Z", 4.0),
+        (f"API-SRD-2-{run_s}", "2026-09-30T05:00:00Z", 5.0),
+    ]:
+        call("POST", "/temperature-readings", {
+            "sample_code": scode, "reading_id": rid,
+            "device_id": f"DEV-STO-{run_s}", "occurred_at": when, "value_celsius": value,
+        })
+    call("POST", "/temperature-calibrations", {
+        "certificate_id": f"API-SCAL-1-{run_s}", "device_id": f"DEV-STO-{run_s}",
+        "valid_from": "2026-09-30T01:00:00Z", "valid_to": "2026-09-30T06:00:00Z",
+        "issued_by": "计量员甲",
+    })
+
+    def show_gap_segments(tag, code):
+        s, r = call("GET", f"/samples/{code}/temperature")
+        for g in r["gap_intervals"]:
+            segs = "、".join(
+                f"{seg['start']}→{seg['end']} 归 "
+                f"{seg['attribution'].get('custodian') or seg['attribution']['kind']}"
+                for seg in g["segments"])
+            print(f"  {tag}缺测区间 {g['start']} → {g['end']}：{segs}")
+        return r
+
+    # 入库前：缺测区间单段归签收人；先留存一份处置意见（用于演示摘要失效）
+    show_gap_segments("入库前：", scode)
+    s, r = call("GET", f"/samples/{scode}/temperature/anomalies")
+    sgap = next(a for a in r["items"] if a["anomaly_type"] == "gap_interval")
+    s, r = call("POST", f"/samples/{scode}/temperature/anomalies/dispositions", {
+        "disposition_no": f"API-SDSP-1-{run_s}", "sample_code": scode,
+        "anomaly_id": sgap["anomaly_id"],
+        "expected_evidence_digest": sgap["evidence_digest"],
+        "decision": "acknowledged", "reason": "认可缺测（入库前证据）", "handler": "质控员赵",
+    })
+    show("入库前处置缺测（201）", s, r, "disposition", "status")
+
+    # 乱序补录有效入库事件（04:00，实验室）→ 缺测区间按入库时刻拆分，后段归实验室；
+    # 分段变化使证据摘要改变，旧处置意见在入库提交事务内即失效（永久留痕、不复活）
+    call("POST", "/events", {
+        "event_id": f"API-SEVT-S1-{run_s}", "event_type": "storage", "sample_code": scode,
+        "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室",
+    })
+    print("补录有效入库（04:00 实验室）后：")
+    show_gap_segments("普通查询：", scode)
+    s, r = call("GET", f"/samples/{scode}/temperature/trusted")
+    for g in r["gap_intervals"]:
+        print("  可信查询同样拆分：",
+              [(seg["start"], seg["attribution"].get("custodian")) for seg in g["segments"]])
+    s, r = call("GET", f"/samples/{scode}/temperature/anomalies")
+    sgap2 = next(a for a in r["items"] if a["anomaly_id"] == sgap["anomaly_id"])
+    print(f"  旧处置状态: {sgap2['invalidated_history'][0]['status']}"
+          f"（{sgap2['invalidated_history'][0]['invalidate_reason']}，提交事务内失效）"
+          f" | 当前异常: {sgap2['disposition_status']}（未处置）")
+
+    # 作废入库事件 → 摘要恢复原值，但旧意见不复活；可用新单号按原摘要重新处置
+    call("POST", "/corrections", {
+        "correction_id": f"API-SFIX-1-{run_s}", "sample_code": scode,
+        "target_event_id": f"API-SEVT-S1-{run_s}", "action": "void",
+        "operator": "质控员", "reason": "示例：入库单作废，演示摘要恢复而旧意见不复活",
+    })
+    s, r = call("GET", f"/samples/{scode}/temperature/anomalies")
+    sgap3 = next(a for a in r["items"] if a["anomaly_id"] == sgap["anomaly_id"])
+    print(f"作废入库后摘要恢复原值: {sgap3['evidence_digest'] == sgap['evidence_digest']}"
+          f" | 旧意见仍 {sgap3['invalidated_history'][0]['status']}（不复活）")
+    s, r = call("POST", f"/samples/{scode}/temperature/anomalies/dispositions", {
+        "disposition_no": f"API-SDSP-2-{run_s}", "sample_code": scode,
+        "anomaly_id": sgap["anomaly_id"],
+        "expected_evidence_digest": sgap3["evidence_digest"],
+        "decision": "acknowledged", "reason": "证据恢复后重新认可", "handler": "质控员赵",
+    })
+    show("恢复原摘要后以新单号重新处置（201）", s, r, "disposition", "status")
+
     # 18) 测温设备校准证明 + 可信复核（证明可晚于读数补录，不改变原始读数/版本/案卷）
     print("\n=== 测温设备校准证明与可信复核 ===")
     cal_id = f"API-CAL-{run_id}"

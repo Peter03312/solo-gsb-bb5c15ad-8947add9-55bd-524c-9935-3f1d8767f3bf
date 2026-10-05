@@ -21,7 +21,7 @@ from .service import (
 from .temperature import (
     _attribution_at,
     _config_view,
-    _custody_periods,
+    _custody_replay,
     _gap_intervals,
     _get_config_row,
 )
@@ -324,7 +324,7 @@ def get_trusted_temperature_review(
         (sample["id"],),
     ).fetchall()
     events.sort(key=event_time_key)
-    periods = _custody_periods(sample, events)
+    periods, split_times = _custody_replay(sample, events)
     certs_by_device = _certificates_by_device(conn, {r["device_id"] for r in readings})
 
     min_c = config["min_celsius"]
@@ -369,7 +369,7 @@ def get_trusted_temperature_review(
             "attribution": _attribution_at(periods, r["occurred_at"]),
         })
 
-    gaps = _gap_intervals(certified_rows, max_interval, events, periods)
+    gaps = _gap_intervals(certified_rows, max_interval, split_times, periods)
     assessable = bool(certified_rows)
 
     return {

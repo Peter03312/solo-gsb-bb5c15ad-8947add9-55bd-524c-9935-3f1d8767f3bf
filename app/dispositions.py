@@ -8,9 +8,9 @@
 
 证据摘要（evidence_digest）：对异常项的全部证据要素做规范 JSON 的 SHA-256——
   超温点含读数（设备/时刻/数值/方向/限值）、覆盖该读数的校准证明号、依当前有效保管链
-  重算的归属；缺测区间含端点读数、两端校准证明号、总时长/最大间隔、跨移交/签收时刻
-  拆分后的逐段时间与归属。读数补录、证明补录或作废、保管链纠错使异常消失或任一要素
-  变化时，摘要随之变化（或异常项消失）。
+  重算的归属；缺测区间含端点读数、两端校准证明号、总时长/最大间隔、跨移交/签收及
+  有效入库（实际改变保管归属）时刻拆分后的逐段时间与归属。读数补录、证明补录或作废、
+  保管链纠错使异常消失或任一要素变化时，摘要随之变化（或异常项消失）。
 
 处置规则：
   * 提交必须回传查询时所见的稳定标识与证据摘要；仅接受当前仍存在且摘要一致的异常项；
@@ -148,7 +148,7 @@ def _gap_summary(g: dict[str, Any], endpoint_certs: dict[str, str | None]) -> st
         f"缺测区间：相邻有证读数 {g['before_reading_id']}"
         f"（证明 {endpoint_certs[g['before_reading_id']] or '无'}）与 {g['after_reading_id']}"
         f"（证明 {endpoint_certs[g['after_reading_id']] or '无'}）间隔 {g['duration_seconds']} 秒，"
-        f"超过最大测温间隔 {g['max_interval_seconds']} 秒，跨移交/签收时刻拆分为 "
+        f"超过最大测温间隔 {g['max_interval_seconds']} 秒，跨移交/签收/入库归属变更时刻拆分为 "
         f"{len(g['segments'])} 段{tail}"
     )
 

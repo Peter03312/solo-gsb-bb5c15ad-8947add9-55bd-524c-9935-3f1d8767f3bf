@@ -211,11 +211,14 @@ check("缺测区间 2 跨签收时刻拆分：在途→签收人",
       [s["attribution"]["kind"] for s in g2["segments"]] == ["in_transit", "custodian"]
       and g2["segments"][1]["attribution"]["custodian"] == "李运输"
       and g2["segments"][1]["start"] == "2026-09-30T05:00:00Z", str(g2))
-check("缺测区间 3 不跨移交/签收（入库不拆分）为单段",
-      len(g3["segments"]) == 1 and g3["start"] == "2026-09-30T05:30:00Z"
-      and g3["end"] == "2026-09-30T06:30:00Z", str(g3))
-check("缺测区间 3 归属按段起始时刻（入库前保管人）",
-      g3["segments"][0]["attribution"] == {"kind": "custodian", "custodian": "李运输"}, str(g3))
+check("缺测区间 3 跨有效入库时刻拆分（入库实际改变保管归属）",
+      len(g3["segments"]) == 2 and g3["start"] == "2026-09-30T05:30:00Z"
+      and g3["end"] == "2026-09-30T06:30:00Z"
+      and g3["segments"][0]["end"] == "2026-09-30T06:00:00Z"
+      and g3["segments"][1]["start"] == "2026-09-30T06:00:00Z", str(g3))
+check("缺测区间 3 归属：入库前签收人 → 入库后实验室",
+      g3["segments"][0]["attribution"] == {"kind": "custodian", "custodian": "李运输"}
+      and g3["segments"][1]["attribution"] == {"kind": "custodian", "custodian": "实验室"}, str(g3))
 
 # ---------------------------------------------------------------- 4. 断链 → 待核
 print("4) 断链导致归属不能确定时标为待核（pending_review）")
@@ -448,8 +451,180 @@ check("间隔超过限值 1 秒即报缺测",
       len(v["gap_intervals"]) == 1 and v["gap_intervals"][0]["duration_seconds"] == 1801,
       str(v["gap_intervals"]))
 
-# ---------------------------------------------------------------- 9. 并发
-print("9) 并发：同号同内容一建一幂等；同号异内容/同时刻一胜一败")
+# ---------------------------------------------------------------- 9. 有效入库拆分缺测区间（本轮修复）
+print("9) 缺测区间分段依据：有效入库实际改变归属时拆分；无效入库不拆分；分界与读数重合无零时长段")
+# 9.1) 在途期间入库（缺签收，无效）不拆分
+reg("T-STO-OPEN", collector="王采集")
+cfg("T-STO-OPEN")
+ev({"event_id": "EVT-SO-T1", "event_type": "transfer", "sample_code": "T-STO-OPEN",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-SO",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-SO-S1", "event_type": "storage", "sample_code": "T-STO-OPEN",
+    "occurred_at": "2026-09-30T03:30:00Z", "custodian": "实验室"})   # 在途期间入库：无效，不转移责任
+ev({"event_id": "EVT-SO-R1", "event_type": "receive", "sample_code": "T-STO-OPEN",
+    "occurred_at": "2026-09-30T05:00:00Z", "transfer_no": "TR-SO",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+rd("T-STO-OPEN", "RD-SO1", "2026-09-30T03:00:00Z", 4.0)
+rd("T-STO-OPEN", "RD-SO2", "2026-09-30T06:00:00Z", 5.0)
+v = review("T-STO-OPEN").json()
+check("在途期间无效入库不拆分（仅签收时刻拆分）",
+      kinds(v) == [["in_transit", "custodian"]]
+      and v["gap_intervals"][0]["segments"][1]["start"] == "2026-09-30T05:00:00Z"
+      and v["gap_intervals"][0]["segments"][1]["attribution"]["custodian"] == "李运输",
+      str(v["gap_intervals"]))
+
+# 9.2) 缺前序移交-签收链的入库（无效）不拆分
+reg("T-STO-NOCHAIN", collector="王采集")
+cfg("T-STO-NOCHAIN")
+ev({"event_id": "EVT-SN-S1", "event_type": "storage", "sample_code": "T-STO-NOCHAIN",
+    "occurred_at": "2026-09-30T03:00:00Z", "custodian": "实验室"})   # 缺前序链：待补证，不转移责任
+rd("T-STO-NOCHAIN", "RD-SN1", "2026-09-30T02:00:00Z", 4.0)
+rd("T-STO-NOCHAIN", "RD-SN2", "2026-09-30T05:00:00Z", 5.0)
+v = review("T-STO-NOCHAIN").json()
+check("缺前序链的无效入库不拆分（单段仍归采集人）",
+      kinds(v) == [["custodian"]]
+      and v["gap_intervals"][0]["segments"][0]["attribution"]["custodian"] == "王采集",
+      str(v["gap_intervals"]))
+
+# 9.3) 分界与读数时刻重合时不产生零时长段
+reg("T-STO-ALIGN", collector="王采集")
+cfg("T-STO-ALIGN")
+ev({"event_id": "EVT-SA-T1", "event_type": "transfer", "sample_code": "T-STO-ALIGN",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-SA",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-SA-R1", "event_type": "receive", "sample_code": "T-STO-ALIGN",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-SA",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-SA-S1", "event_type": "storage", "sample_code": "T-STO-ALIGN",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+rd("T-STO-ALIGN", "RD-SA1", "2026-09-30T02:30:00Z", 4.0)
+rd("T-STO-ALIGN", "RD-SA2", "2026-09-30T04:00:00Z", 5.0)   # 读数恰在入库时刻
+rd("T-STO-ALIGN", "RD-SA3", "2026-09-30T05:30:00Z", 6.0)
+v = review("T-STO-ALIGN").json()
+check("分界与读数重合：前区间不按入库时刻再分（无零时长段）",
+      kinds(v) == [["in_transit", "custodian"], ["custodian"]]
+      and all(s["duration_seconds"] > 0 for g in v["gap_intervals"] for s in g["segments"]),
+      str(v["gap_intervals"]))
+check("入库时刻读数起的后区间单段归实验室",
+      v["gap_intervals"][1]["segments"][0]["start"] == "2026-09-30T04:00:00Z"
+      and v["gap_intervals"][1]["segments"][0]["attribution"]
+      == {"kind": "custodian", "custodian": "实验室"}, str(v["gap_intervals"]))
+
+# 9.4) 多次有效入库依次改变归属依次拆分
+reg("T-STO-MULTI", collector="王采集")
+cfg("T-STO-MULTI")
+ev({"event_id": "EVT-SM-T1", "event_type": "transfer", "sample_code": "T-STO-MULTI",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-SM",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-SM-R1", "event_type": "receive", "sample_code": "T-STO-MULTI",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-SM",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-SM-S1", "event_type": "storage", "sample_code": "T-STO-MULTI",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "冷库甲"})
+ev({"event_id": "EVT-SM-S2", "event_type": "storage", "sample_code": "T-STO-MULTI",
+    "occurred_at": "2026-09-30T04:40:00Z", "custodian": "冷库乙"})
+rd("T-STO-MULTI", "RD-SM1", "2026-09-30T03:30:00Z", 4.0)
+rd("T-STO-MULTI", "RD-SM2", "2026-09-30T05:00:00Z", 5.0)
+v = review("T-STO-MULTI").json()
+check("多次有效入库依次拆分并逐段归属",
+      [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == ["李运输", "冷库甲", "冷库乙"]
+      and [s["start"] for s in v["gap_intervals"][0]["segments"]]
+      == ["2026-09-30T03:30:00Z", "2026-09-30T04:00:00Z", "2026-09-30T04:40:00Z"],
+      str(v["gap_intervals"]))
+
+# 9.5) 断链待核期间入库不再产生新拆分（归属待核不恢复）
+reg("T-STO-BROKEN", collector="王采集")
+cfg("T-STO-BROKEN")
+ev({"event_id": "EVT-SB-T1", "event_type": "transfer", "sample_code": "T-STO-BROKEN",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-SB1",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-SB-R1", "event_type": "receive", "sample_code": "T-STO-BROKEN",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-SB1",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-SB-T2", "event_type": "transfer", "sample_code": "T-STO-BROKEN",
+    "occurred_at": "2026-09-30T03:30:00Z", "transfer_no": "TR-SB2",
+    "from_custodian": "王采集", "to_custodian": "赵六"})   # 移交人非当前保管人 → 断链
+ev({"event_id": "EVT-SB-S1", "event_type": "storage", "sample_code": "T-STO-BROKEN",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+rd("T-STO-BROKEN", "RD-SB1", "2026-09-30T03:10:00Z", 4.0)
+rd("T-STO-BROKEN", "RD-SB2", "2026-09-30T05:00:00Z", 5.0)
+v = review("T-STO-BROKEN").json()
+check("断链后入库不再拆分：待核段贯通到区间末",
+      kinds(v) == [["custodian", "pending_review"]]
+      and v["gap_intervals"][0]["segments"][1]["start"] == "2026-09-30T03:30:00Z"
+      and v["gap_intervals"][0]["segments"][1]["end"] == "2026-09-30T05:00:00Z",
+      str(v["gap_intervals"]))
+
+# 9.6) 乱序补录入库事件即时重算归属
+reg("T-STO-BACKFILL", collector="王采集")
+cfg("T-STO-BACKFILL")
+ev({"event_id": "EVT-SF-T1", "event_type": "transfer", "sample_code": "T-STO-BACKFILL",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-SF",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-SF-R1", "event_type": "receive", "sample_code": "T-STO-BACKFILL",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-SF",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+rd("T-STO-BACKFILL", "RD-SF1", "2026-09-30T03:30:00Z", 4.0)
+rd("T-STO-BACKFILL", "RD-SF2", "2026-09-30T05:00:00Z", 5.0)
+v = review("T-STO-BACKFILL").json()
+check("补录入库前缺测段单段归签收人",
+      kinds(v) == [["custodian"]]
+      and v["gap_intervals"][0]["segments"][0]["attribution"]["custodian"] == "李运输",
+      str(v["gap_intervals"]))
+ev({"event_id": "EVT-SF-S1", "event_type": "storage", "sample_code": "T-STO-BACKFILL",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})   # 乱序补录入库
+v = review("T-STO-BACKFILL").json()
+check("乱序补录入库后即时重算：按入库时刻拆分",
+      [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == ["李运输", "实验室"]
+      and v["gap_intervals"][0]["segments"][1]["start"] == "2026-09-30T04:00:00Z",
+      str(v["gap_intervals"]))
+
+# 9.7) 入库事件替换/作废纠错后按当前有效链重算
+reg("T-STO-CORR", collector="王采集")
+cfg("T-STO-CORR")
+ev({"event_id": "EVT-SC-T1", "event_type": "transfer", "sample_code": "T-STO-CORR",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-SC",
+    "from_custodian": "王采集", "to_custodian": "李运输"})
+ev({"event_id": "EVT-SC-R1", "event_type": "receive", "sample_code": "T-STO-CORR",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-SC",
+    "receiver": "李运输", "seal_no": "SEAL-T"})
+ev({"event_id": "EVT-SC-S1", "event_type": "storage", "sample_code": "T-STO-CORR",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+rd("T-STO-CORR", "RD-SC1", "2026-09-30T03:30:00Z", 4.0)
+rd("T-STO-CORR", "RD-SC2", "2026-09-30T05:00:00Z", 5.0)
+v = review("T-STO-CORR").json()
+check("纠错前按入库时刻拆分",
+      [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == ["李运输", "实验室"], str(v["gap_intervals"]))
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "FIX-SC-1", "sample_code": "T-STO-CORR", "target_event_id": "EVT-SC-S1",
+    "action": "replace", "operator": "质控员", "reason": "入库时间与库房登记错误",
+    "new_event": {"event_id": "EVT-SC-S2", "event_type": "storage",
+                  "occurred_at": "2026-09-30T04:30:00Z", "custodian": "冷库乙"}})
+check("入库替换纠错 201", r.status_code == 201, r.text)
+v = review("T-STO-CORR").json()
+check("入库替换后按新时刻与新保管人重算",
+      [s["attribution"].get("custodian") for s in v["gap_intervals"][0]["segments"]]
+      == ["李运输", "冷库乙"]
+      and v["gap_intervals"][0]["segments"][1]["start"] == "2026-09-30T04:30:00Z",
+      str(v["gap_intervals"]))
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "FIX-SC-2", "sample_code": "T-STO-CORR", "target_event_id": "EVT-SC-S2",
+    "action": "void", "operator": "质控员", "reason": "入库记录整单作废"})
+check("入库作废纠错 201", r.status_code == 201, r.text)
+v = review("T-STO-CORR").json()
+check("入库作废后归属回到签收人单段",
+      kinds(v) == [["custodian"]]
+      and v["gap_intervals"][0]["segments"][0]["attribution"]["custodian"] == "李运输",
+      str(v["gap_intervals"]))
+check("入库纠错后原始读数仍不改",
+      [(x["reading_id"], x["value_celsius"]) for x in v["readings"]]
+      == [("RD-SC1", 4.0), ("RD-SC2", 5.0)], str(v["readings"]))
+
+# ---------------------------------------------------------------- 10. 并发
+print("10) 并发：同号同内容一建一幂等；同号异内容/同时刻一胜一败")
 reg("T-CONC", collector="王采集")
 cfg("T-CONC")
 results: dict[str, int] = {}

@@ -371,11 +371,11 @@ def create_temp_reading_api(data: TempReadingIn) -> JSONResponse:
 
 @app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature", tags=["temperature"])
 def get_temperature_review_api(sample_code: str) -> dict[str, Any]:
-    """测温证据复核：按发生时间列出超温点与缺测区间（跨移交/签收时刻拆分）。
+    """测温证据复核：按发生时间列出超温点与缺测区间（跨移交/签收及有效入库时刻拆分）。
 
     每段依当前有效保管链标明当时保管人（custodian）或在途移交（in_transit）；
-    断链导致归属不能确定时标为待核（pending_review）；乱序补录与移交/签收纠错后
-    再次查询即按最新有效链重算归属。未设定测温配置 → 404 temp_config_not_found。
+    断链导致归属不能确定时标为待核（pending_review）；乱序补录与移交/签收/入库
+    纠错后再次查询即按最新有效链重算归属。未设定测温配置 → 404 temp_config_not_found。
     """
     with db_session() as conn:
         return get_temperature_review(conn, sample_code)
